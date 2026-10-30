@@ -1,0 +1,757 @@
+// Smart Inventory & Operations SaaS — Prisma schema
+// SQLite untuk development; ganti provider ke postgresql untuk produksi.
+// Catatan: enum Prisma tidak didukung SQLite -> semua enumerasi memakai String
+// dan divalidasi di lapisan aplikasi (src/lib/constants.ts).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// 1. Organisasi & Akses (PRD §5, §21.1)
+// ============================================================
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  name         String
+  passwordHash String
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  memberships         Membership[]
+  invitations         Invitation[]           @relation("InvitedBy")
+  auditLogs           AuditLog[]
+  createdTransactions InventoryTransaction[] @relation("TxCreatedBy")
+  postedTransactions  InventoryTransaction[] @relation("TxPostedBy")
+}
+
+model Organization {
+  id           String   @id @default(cuid())
+  name         String
+  businessType String?
+  country      String   @default("ID")
+  currency     String   @default("IDR")
+  timezone     String   @default("Asia/Jakarta")
+  contactEmail String?
+  phone        String?
+  address      String?
+  // ACTIVE | SUSPENDED
+  status       String   @default("ACTIVE")
+  isDemo       Boolean  @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  memberships      Membership[]
+  invitations      Invitation[]
+  subscription     Subscription?
+  counters         DocCounter[]
+  categories       ItemCategory[]
+  uoms             UnitOfMeasure[]
+  uomConversions   UomConversion[]
+  items            Item[]
+  warehouses       Warehouse[]
+  suppliers        Supplier[]
+  customers        Customer[]
+  transactions     InventoryTransaction[]
+  ledgerEntries    LedgerEntry[]
+  balances         StockBalance[]
+  reservations     StockReservation[]
+  purchaseOrders   PurchaseOrder[]
+  boms             BillOfMaterials[]
+  productionOrders ProductionOrder[]
+  scrapRecords     ScrapRecord[]
+  stockCounts      StockCount[]
+  auditLogs        AuditLog[]
+  alerts           Alert[]
+  importJobs       ImportJob[]
+  storageLocations StorageLocation[]
+}
+
+model Membership {
+  id             String   @id @default(cuid())
+  userId         String
+  organizationId String
+  // OWNER | MANAGER | WAREHOUSE | PRODUCTION | VIEWER
+  role           String
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+
+  user         User         @relation(fields: [userId], references: [id])
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@unique([userId, organizationId])
+  @@index([organizationId])
+}
+
+model Invitation {
+  id             String    @id @default(cuid())
+  organizationId String
+  email          String
+  role           String
+  token          String    @unique
+  status         String    @default("PENDING") // PENDING | ACCEPTED | REVOKED | EXPIRED
+  invitedById    String
+  acceptedAt     DateTime?
+  expiresAt      DateTime
+  createdAt      DateTime  @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  invitedBy    User         @relation("InvitedBy", fields: [invitedById], references: [id])
+
+  @@index([organizationId])
+}
+
+model Plan {
+  id            String  @id @default(cuid())
+  code          String  @unique // FREE | PRO | BUSINESS
+  name          String
+  description   String?
+  priceMonthly  Int     @default(0)
+  maxItems      Int? // null = tidak dibatasi
+  maxUsers      Int?
+  maxWarehouses Int?
+  sortOrder     Int     @default(0)
+  isActive      Boolean @default(true)
+
+  subscriptions Subscription[]
+}
+
+model Subscription {
+  id               String    @id @default(cuid())
+  organizationId   String    @unique
+  planId           String
+  // TRIAL | ACTIVE | PAST_DUE | SUSPENDED | CANCELLED | EXPIRED
+  status           String    @default("ACTIVE")
+  trialEndsAt      DateTime?
+  currentPeriodEnd DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  plan         Plan         @relation(fields: [planId], references: [id])
+}
+
+// Penomoran dokumen per organisasi (RCV-2026-000001 dst.)
+model DocCounter {
+  id             String @id @default(cuid())
+  organizationId String
+  key            String // mis. "RCV-2026"
+  value          Int    @default(0)
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@unique([organizationId, key])
+}
+
+// ============================================================
+// 2. Master Data (PRD §6, §7, §21.2)
+// ============================================================
+
+model ItemCategory {
+  id             String  @id @default(cuid())
+  organizationId String
+  name           String
+  description    String?
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  items        Item[]
+
+  @@unique([organizationId, name])
+}
+
+model UnitOfMeasure {
+  id             String @id @default(cuid())
+  organizationId String
+  code           String // pcs, kg, g, m, ...
+  name           String
+
+  organization    Organization    @relation(fields: [organizationId], references: [id])
+  items           Item[]
+  conversionsFrom UomConversion[] @relation("FromUom")
+  conversionsTo   UomConversion[] @relation("ToUom")
+
+  @@unique([organizationId, code])
+}
+
+model UomConversion {
+  id             String @id @default(cuid())
+  organizationId String
+  fromUomId      String
+  toUomId        String
+  factor         String // 1 fromUom = factor toUom
+
+  organization Organization  @relation(fields: [organizationId], references: [id])
+  fromUom      UnitOfMeasure @relation("FromUom", fields: [fromUomId], references: [id])
+  toUom        UnitOfMeasure @relation("ToUom", fields: [toUomId], references: [id])
+
+  @@unique([organizationId, fromUomId, toUomId])
+}
+
+model Item {
+  id                 String   @id @default(cuid())
+  organizationId     String
+  code               String // SKU, unik per organisasi
+  name               String
+  description        String?
+  // RAW_MATERIAL | WIP | FINISHED_GOODS | CONSUMABLE | RESALE | SCRAP
+  type               String
+  categoryId         String?
+  baseUomId          String
+  barcode            String?
+  brand              String?
+  manufacturer       String?
+  defaultSupplierId  String?
+  minStock           String?
+  reorderQty         String?
+  defaultCost        String?
+  defaultWarehouseId String?
+  notes              String?
+  isActive           Boolean  @default(true)
+  // Moving weighted average cost organisasi (basis unit)
+  avgCost            String   @default("0")
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  organization         Organization               @relation(fields: [organizationId], references: [id])
+  category             ItemCategory?              @relation(fields: [categoryId], references: [id])
+  baseUom              UnitOfMeasure              @relation(fields: [baseUomId], references: [id])
+  balances             StockBalance[]
+  txLines              InventoryTransactionLine[]
+  ledgerEntries        LedgerEntry[]
+  reservations         StockReservation[]
+  poLines              PurchaseOrderLine[]
+  bomAsProduct         BillOfMaterials[]
+  bomComponents        BOMComponent[]
+  outputs              ProductionOutput[]
+  materialConsumptions MaterialConsumption[]      @relation("ConsumedItem")
+  scrapRecords         ScrapRecord[]
+  scrapSourceRecords   ScrapRecord[]              @relation("ScrapSourceItem")
+  productionOrders     ProductionOrder[]
+  stockCountLines      StockCountLine[]
+  alerts               Alert[]                    @relation("AlertItem")
+
+  @@unique([organizationId, code])
+  @@index([organizationId, type])
+  @@index([organizationId, isActive])
+}
+
+model Warehouse {
+  id             String   @id @default(cuid())
+  organizationId String
+  code           String
+  name           String
+  address        String?
+  manager        String?
+  isActive       Boolean  @default(true)
+  notes          String?
+  createdAt      DateTime @default(now())
+
+  organization Organization               @relation(fields: [organizationId], references: [id])
+  locations    StorageLocation[]
+  txLines      InventoryTransactionLine[] @relation("LineWarehouse")
+  stockCounts  StockCount[]               @relation("StockCountWarehouse")
+
+  @@unique([organizationId, code])
+}
+
+model StorageLocation {
+  id             String  @id @default(cuid())
+  organizationId String
+  warehouseId    String
+  code           String
+  name           String
+  // RAW | CUTTING | FINISHED | SCRAP | GENERAL
+  type           String  @default("GENERAL")
+  isActive       Boolean @default(true)
+
+  organization  Organization               @relation(fields: [organizationId], references: [id])
+  warehouse     Warehouse                  @relation(fields: [warehouseId], references: [id])
+  balances      StockBalance[]
+  txLines       InventoryTransactionLine[]
+  ledgerEntries LedgerEntry[]
+  reservations  StockReservation[]
+  countLines    StockCountLine[]
+
+  @@unique([organizationId, code])
+  @@index([warehouseId])
+}
+
+model Supplier {
+  id             String  @id @default(cuid())
+  organizationId String
+  code           String
+  name           String
+  contactPerson  String?
+  phone          String?
+  email          String?
+  address        String?
+  taxId          String?
+  notes          String?
+  isActive       Boolean @default(true)
+
+  organization   Organization    @relation(fields: [organizationId], references: [id])
+  purchaseOrders PurchaseOrder[]
+
+  @@unique([organizationId, code])
+}
+
+model Customer {
+  id             String  @id @default(cuid())
+  organizationId String
+  code           String
+  name           String
+  contactPerson  String?
+  phone          String?
+  email          String?
+  address        String?
+  notes          String?
+  isActive       Boolean @default(true)
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@unique([organizationId, code])
+}
+
+// ============================================================
+// 3. Inventory Engine (PRD §8, §21.3)
+// ============================================================
+
+// Dokumen transaksi (header). Satu-satunya jalur perubahan stok.
+model InventoryTransaction {
+  id             String    @id @default(cuid())
+  organizationId String
+  number         String // RCV-2026-000001
+  // OPENING | RECEIPT | ISSUE | TRANSFER | ADJUSTMENT | CONSUMPTION | OUTPUT | SCRAP_IN | DISPOSAL
+  type           String
+  // DRAFT | POSTED | CANCELLED | REVERSED
+  status         String    @default("DRAFT")
+  date           DateTime
+  postedAt       DateTime?
+  notes          String?
+  reason         String?
+  reference      String? // nomor dokumen eksternal (surat jalan dsb.)
+  refType        String? // PURCHASE_ORDER | PRODUCTION_ORDER | SCRAP_RECORD | STOCK_COUNT | PARENT_TX
+  refId          String?
+  refNumber      String?
+  idempotencyKey String?
+  createdById    String
+  postedById     String?
+  reversalOfId   String?   @unique
+  createdAt      DateTime  @default(now())
+
+  organization Organization               @relation(fields: [organizationId], references: [id])
+  createdBy    User                       @relation("TxCreatedBy", fields: [createdById], references: [id])
+  postedBy     User?                      @relation("TxPostedBy", fields: [postedById], references: [id])
+  reversalOf   InventoryTransaction?      @relation("TxReversal", fields: [reversalOfId], references: [id])
+  reversals    InventoryTransaction[]     @relation("TxReversal")
+  lines        InventoryTransactionLine[]
+  ledger       LedgerEntry[]
+
+  @@unique([organizationId, number])
+  @@unique([organizationId, idempotencyKey])
+  @@index([organizationId, type, status])
+  @@index([organizationId, date])
+}
+
+model InventoryTransactionLine {
+  id            String  @id @default(cuid())
+  transactionId String
+  itemId        String
+  warehouseId   String
+  locationId    String
+  // Positif = masuk, negatif = keluar, dalam base unit
+  quantity      String
+  unitCost      String?
+  value         String  @default("0")
+  notes         String?
+
+  transaction InventoryTransaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  item        Item                 @relation(fields: [itemId], references: [id])
+  warehouse   Warehouse            @relation("LineWarehouse", fields: [warehouseId], references: [id])
+  location    StorageLocation      @relation(fields: [locationId], references: [id])
+
+  @@index([transactionId])
+  @@index([itemId])
+  @@index([locationId])
+}
+
+// Jurnal ledger — hanya dibuat saat posting, tidak pernah diubah.
+model LedgerEntry {
+  id             String   @id @default(cuid())
+  organizationId String
+  transactionId  String
+  lineId         String
+  itemId         String
+  locationId     String
+  // POST | REVERSE
+  entryType      String   @default("POST")
+  quantity       String // signed
+  unitCost       String?
+  value          String // signed
+  runningQty     String? // saldo lokasi setelah entry
+  createdAt      DateTime @default(now())
+  userId         String
+
+  transaction  InventoryTransaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  item         Item                 @relation(fields: [itemId], references: [id])
+  location     StorageLocation      @relation(fields: [locationId], references: [id])
+  organization Organization         @relation(fields: [organizationId], references: [id])
+
+  @@index([organizationId, itemId, createdAt])
+  @@index([organizationId, locationId])
+  @@index([transactionId])
+}
+
+// Saldo agregat per item+lokasi; direkonsiliasi dengan ledger.
+model StockBalance {
+  id             String @id @default(cuid())
+  organizationId String
+  itemId         String
+  locationId     String
+  onHand         String @default("0")
+  reserved       String @default("0")
+
+  item         Item            @relation(fields: [itemId], references: [id])
+  location     StorageLocation @relation(fields: [locationId], references: [id])
+  organization Organization    @relation(fields: [organizationId], references: [id])
+
+  @@unique([itemId, locationId])
+  @@index([organizationId])
+}
+
+model StockReservation {
+  id             String   @id @default(cuid())
+  organizationId String
+  itemId         String
+  locationId     String
+  quantity       String
+  refType        String // PRODUCTION_ORDER
+  refId          String
+  note           String?
+  createdById    String
+  createdAt      DateTime @default(now())
+
+  item         Item            @relation(fields: [itemId], references: [id])
+  location     StorageLocation @relation(fields: [locationId], references: [id])
+  organization Organization    @relation(fields: [organizationId], references: [id])
+
+  @@index([organizationId, refType, refId])
+}
+
+// ============================================================
+// 4. Pembelian & Pengeluaran (PRD §9-§11, §21.4)
+// ============================================================
+
+model PurchaseOrder {
+  id                     String    @id @default(cuid())
+  organizationId         String
+  number                 String // PO-2026-000001
+  supplierId             String
+  orderDate              DateTime
+  expectedDate           DateTime?
+  destinationWarehouseId String?
+  // DRAFT | SUBMITTED | APPROVED | PARTIALLY_RECEIVED | RECEIVED | CANCELLED
+  status                 String    @default("DRAFT")
+  notes                  String?
+  createdById            String
+  approvedById           String?
+  approvedAt             DateTime?
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
+
+  organization Organization        @relation(fields: [organizationId], references: [id])
+  supplier     Supplier            @relation(fields: [supplierId], references: [id])
+  lines        PurchaseOrderLine[]
+
+  @@unique([organizationId, number])
+  @@index([organizationId, status])
+}
+
+model PurchaseOrderLine {
+  id              String  @id @default(cuid())
+  purchaseOrderId String
+  itemId          String
+  orderedQty      String
+  unitPrice       String
+  receivedQty     String  @default("0")
+  notes           String?
+
+  purchaseOrder PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  item          Item          @relation(fields: [itemId], references: [id])
+
+  @@index([purchaseOrderId])
+}
+
+// Issue / pengeluaran memakai InventoryTransaction type ISSUE dengan
+// reason + kolom tujuan disimpan pada notes terstruktur (issueType).
+
+// ============================================================
+// 5. Produksi (PRD §13, §21.5)
+// ============================================================
+
+model BillOfMaterials {
+  id             String   @id @default(cuid())
+  organizationId String
+  code           String // BOM-000001
+  itemId         String // finished good
+  version        Int      @default(1)
+  outputQty      String
+  notes          String?
+  // DRAFT | ACTIVE | ARCHIVED
+  status         String   @default("ACTIVE")
+  createdById    String
+  createdAt      DateTime @default(now())
+
+  organization     Organization      @relation(fields: [organizationId], references: [id])
+  item             Item              @relation(fields: [itemId], references: [id])
+  components       BOMComponent[]
+  productionOrders ProductionOrder[]
+
+  @@unique([organizationId, code])
+  @@unique([organizationId, itemId, version])
+}
+
+model BOMComponent {
+  id              String  @id @default(cuid())
+  bomId           String
+  componentItemId String
+  quantity        String // per 1 output BOM
+  scrapPercent    String  @default("0")
+  notes           String?
+
+  bom           BillOfMaterials @relation(fields: [bomId], references: [id], onDelete: Cascade)
+  componentItem Item            @relation(fields: [componentItemId], references: [id])
+
+  @@unique([bomId, componentItemId])
+}
+
+model ProductionOrder {
+  id                     String    @id @default(cuid())
+  organizationId         String
+  number                 String // MO-2026-000001
+  itemId                 String
+  bomId                  String
+  plannedQty             String
+  plannedStartDate       DateTime?
+  plannedEndDate         DateTime?
+  sourceWarehouseId      String
+  destinationWarehouseId String?
+  assignedTo             String?
+  // DRAFT | CONFIRMED | IN_PROGRESS | COMPLETED | CANCELLED
+  status                 String    @default("DRAFT")
+  notes                  String?
+  createdById            String
+  startedAt              DateTime?
+  completedAt            DateTime?
+  createdAt              DateTime  @default(now())
+
+  organization Organization          @relation(fields: [organizationId], references: [id])
+  item         Item                  @relation(fields: [itemId], references: [id])
+  bom          BillOfMaterials       @relation(fields: [bomId], references: [id])
+  consumptions MaterialConsumption[]
+  outputs      ProductionOutput[]
+  scrapRecords ScrapRecord[]
+
+  @@unique([organizationId, number])
+  @@index([organizationId, status])
+}
+
+model MaterialConsumption {
+  id                String   @id @default(cuid())
+  organizationId    String
+  productionOrderId String
+  itemId            String
+  sourceLocationId  String
+  plannedQty        String   @default("0")
+  actualQty         String
+  // DRAFT | POSTED
+  status            String   @default("DRAFT")
+  consumedAt        DateTime
+  recordedById      String
+  notes             String?
+  transactionId     String?
+  productionOrder ProductionOrder @relation(fields: [productionOrderId], references: [id])
+  item            Item            @relation("ConsumedItem", fields: [itemId], references: [id])
+
+  @@index([productionOrderId])
+}
+
+model ProductionOutput {
+  id                    String   @id @default(cuid())
+  organizationId        String
+  productionOrderId     String
+  itemId                String
+  destinationLocationId String
+  plannedQty            String   @default("0")
+  actualQty             String
+  // GOOD | SCRAP
+  resultType            String   @default("GOOD")
+  // DRAFT | POSTED
+  status                String   @default("DRAFT")
+  recordedAt            DateTime
+  recordedById          String
+  notes                 String?
+  transactionId         String?  @unique
+
+  productionOrder ProductionOrder @relation(fields: [productionOrderId], references: [id])
+  item            Item            @relation(fields: [itemId], references: [id])
+
+  @@index([productionOrderId])
+}
+
+// ============================================================
+// 6. Scrap (PRD §14, §21.6)
+// Disposal diwakili InventoryTransaction type DISPOSAL dengan
+// refType=SCRAP_RECORD — keputusan desain terdokumentasi.
+// ============================================================
+
+model ScrapRecord {
+  id                    String   @id @default(cuid())
+  organizationId        String
+  number                String // SCR-2026-000001
+  productionOrderId     String?
+  sourceItemId          String
+  sourceLocationId      String
+  scrapItemId           String
+  scrapQty              String
+  // REUSABLE | SALEABLE | DISPOSAL | PENDING
+  category              String   @default("PENDING")
+  destinationLocationId String?
+  scrapDate             DateTime
+  cause                 String?
+  estimatedValue        String?
+  // DRAFT | POSTED | DISPOSED
+  status                String   @default("DRAFT")
+  transactionId         String?  @unique
+  disposalTransactionId String?  @unique
+  recordedById          String
+  notes                 String?
+  createdAt             DateTime @default(now())
+
+  organization    Organization     @relation(fields: [organizationId], references: [id])
+  productionOrder ProductionOrder? @relation(fields: [productionOrderId], references: [id])
+  sourceItem      Item             @relation("ScrapSourceItem", fields: [sourceItemId], references: [id])
+  scrapItem       Item             @relation(fields: [scrapItemId], references: [id])
+
+  @@unique([organizationId, number])
+  @@index([organizationId, category, status])
+}
+
+// ============================================================
+// 7. Stock Opname (PRD §12)
+// ============================================================
+
+model StockCount {
+  id                      String    @id @default(cuid())
+  organizationId          String
+  number                  String // OPN-2026-000001
+  warehouseId             String
+  locationId              String?
+  // DRAFT | IN_PROGRESS | SUBMITTED | RECONCILED | CANCELLED
+  status                  String    @default("IN_PROGRESS")
+  notes                   String?
+  createdById             String
+  startedAt               DateTime  @default(now())
+  submittedAt             DateTime?
+  reconciledAt            DateTime?
+  adjustmentTransactionId String?   @unique
+  createdAt               DateTime  @default(now())
+
+  organization Organization     @relation(fields: [organizationId], references: [id])
+  warehouse    Warehouse        @relation("StockCountWarehouse", fields: [warehouseId], references: [id])
+  lines        StockCountLine[]
+
+  @@unique([organizationId, number])
+  @@index([organizationId, status])
+}
+
+model StockCountLine {
+  id                   String  @id @default(cuid())
+  stockCountId         String
+  itemId               String
+  locationId           String
+  baselineQty          String
+  countedQty           String?
+  systemQtyAtReconcile String?
+  adjustedQty          String?
+
+  stockCount StockCount      @relation(fields: [stockCountId], references: [id], onDelete: Cascade)
+  item       Item            @relation(fields: [itemId], references: [id])
+  location   StorageLocation @relation(fields: [locationId], references: [id])
+
+  @@unique([stockCountId, itemId, locationId])
+  @@index([stockCountId])
+}
+
+// ============================================================
+// 8. Pendukung (PRD §15, §17, §18, §21.7)
+// ============================================================
+
+model Alert {
+  id             String    @id @default(cuid())
+  organizationId String
+  // LOW_STOCK | UNCATEGORIZED_SCRAP | PO_LATE
+  type           String
+  itemId         String?
+  locationId     String?
+  message        String
+  currentQty     String?
+  thresholdQty   String?
+  // ACTIVE | RESOLVED
+  status         String    @default("ACTIVE")
+  resolvedAt     DateTime?
+  createdAt      DateTime  @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  item         Item?        @relation("AlertItem", fields: [itemId], references: [id])
+
+  @@index([organizationId, status, type])
+}
+
+model ImportJob {
+  id             String    @id @default(cuid())
+  organizationId String
+  // ITEMS | OPENING_STOCK
+  type           String
+  fileName       String
+  // VALIDATED | COMMITTED | FAILED
+  status         String
+  totalRows      Int       @default(0)
+  successRows    Int       @default(0)
+  failedRows     Int       @default(0)
+  errors         String? // JSON array [{row, field, message}]
+  dataJson       String? // data tervalidasi menunggu commit
+  createdById    String
+  createdAt      DateTime  @default(now())
+  committedAt    DateTime?
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@index([organizationId])
+}
+
+model AuditLog {
+  id             String   @id @default(cuid())
+  organizationId String?
+  userId         String?
+  action         String // LOGIN, ITEM_CREATE, TX_POST, ...
+  entityType     String
+  entityId       String?
+  before         String? // JSON
+  after          String? // JSON
+  reason         String?
+  createdAt      DateTime @default(now())
+
+  user         User?         @relation(fields: [userId], references: [id])
+  organization Organization? @relation(fields: [organizationId], references: [id])
+
+  @@index([organizationId, createdAt])
+  @@index([organizationId, entityType, entityId])
+}
